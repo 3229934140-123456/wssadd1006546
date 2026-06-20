@@ -2,7 +2,7 @@ from pydantic import BaseModel, ConfigDict
 from datetime import datetime, date, time
 from typing import Optional, List
 from enum import Enum
-from ..models.task import TaskStatus, CallResult
+from ..models.task import TaskStatus, CallResult, ReviewStatus
 
 
 class TaskGroup(str, Enum):
@@ -41,6 +41,14 @@ class CompleteDoctorReviewRequest(BaseModel):
     suggested_review_date: Optional[date] = None
 
 
+class NurseFollowupRequest(BaseModel):
+    task_id: int
+    followup_notes: str
+    followup_result: Optional[str] = None
+    actual_review_date: Optional[date] = None
+    close_review: Optional[bool] = False
+
+
 class AssignmentReasonDetail(BaseModel):
     patient_risk_level: str
     patient_risk_tags: Optional[str] = None
@@ -48,6 +56,16 @@ class AssignmentReasonDetail(BaseModel):
     candidate_scores: List[dict]
     final_decision: str
     reason_summary: str
+    is_snapshot: bool = False
+
+
+class ReviewCollaborationStats(BaseModel):
+    pending_doctor: int = 0
+    doctor_advised: int = 0
+    pending_followup: int = 0
+    closed: int = 0
+    total: int = 0
+    closure_rate: float = 0.0
 
 
 class CallbackTaskResponse(BaseModel):
@@ -76,11 +94,18 @@ class CallbackTaskResponse(BaseModel):
     reassigned_at: Optional[datetime] = None
     reassigned_reason: Optional[str] = None
     assignment_reason: Optional[str] = None
+    assignment_snapshot: Optional[str] = None
     doctor_review_notes: Optional[str] = None
     doctor_conclusion: Optional[str] = None
     suggested_review_date: Optional[date] = None
     reviewed_by_id: Optional[int] = None
     reviewed_at: Optional[datetime] = None
+    review_status: Optional[ReviewStatus] = None
+    nurse_followup_notes: Optional[str] = None
+    followup_by_id: Optional[int] = None
+    followup_at: Optional[datetime] = None
+    followup_result: Optional[str] = None
+    actual_review_date: Optional[date] = None
     created_at: datetime
     updated_at: datetime
     patient: Optional["PatientResponse"] = None
@@ -89,6 +114,7 @@ class CallbackTaskResponse(BaseModel):
     treatment_record: Optional["TreatmentRecordResponse"] = None
     assigned_user: Optional["UserResponse"] = None
     reviewed_by: Optional["UserResponse"] = None
+    followup_by: Optional["UserResponse"] = None
 
 
 from .patient import PatientResponse

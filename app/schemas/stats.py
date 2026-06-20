@@ -26,6 +26,8 @@ class StoreStats(BaseModel):
     abnormal_rate: float = 0.0
     timeout_tasks: int = 0
     doctor_review_tasks: int = 0
+    review_closed: int = 0
+    review_closure_rate: float = 0.0
 
 
 class UserStats(BaseModel):
@@ -66,6 +68,22 @@ class AbnormalTaskItem(BaseModel):
     assigned_user: Optional[str] = None
     doctor_review_notes: Optional[str] = None
     doctor_conclusion: Optional[str] = None
+    review_status: Optional[str] = None
+
+
+class RuleEffectItem(BaseModel):
+    treatment_type_id: int
+    treatment_type_name: str
+    rule_id: int
+    rule_name: str
+    call_window: Optional[str] = None
+    total_tasks: int = 0
+    abnormal_tasks: int = 0
+    abnormal_rate: float = 0.0
+    timeout_tasks: int = 0
+    timeout_rate: float = 0.0
+    doctor_review_tasks: int = 0
+    doctor_review_rate: float = 0.0
 
 
 class StatsOverview(BaseModel):
@@ -79,9 +97,15 @@ class StatsOverview(BaseModel):
     timeout_tasks: int = 0
     doctor_review_tasks: int = 0
     doctor_reviewed_tasks: int = 0
+    review_pending_doctor: int = 0
+    review_doctor_advised: int = 0
+    review_pending_followup: int = 0
+    review_closed: int = 0
+    review_closure_rate: float = 0.0
 
 
 class StatsFilterOptions(BaseModel):
     stores: List[dict] = []
     users: List[dict] = []
     treatment_types: List[dict] = []
+    rules: List[dict] = []

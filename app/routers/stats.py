@@ -11,14 +11,14 @@ from ..database import get_db
 from ..deps import get_current_user, require_roles
 from ..models import (
     CallbackTask, TaskStatus, Store, User, UserRole, Patient,
-    TreatmentRecord, TreatmentType
+    TreatmentRecord, TreatmentType, CallbackRule, ReviewStatus
 )
 from ..schemas.stats import (
     StatsOverview, StoreStats, UserStats, TimeoutTaskItem,
-    AbnormalTaskItem, StatsFilterOptions
+    AbnormalTaskItem, StatsFilterOptions, RuleEffectItem
 )
 from ..services.task_pool_service import (
-    apply_overdue_filter, count_overdue_tasks
+    apply_overdue_filter, count_overdue_tasks, FINISHED_STATUSES
 )
 
 router = APIRouter(prefix="/api/stats", tags=["统计看板"])
@@ -94,11 +94,14 @@ def get_filter_options(
               "role": u.role.value, "store_id": u.store_id} for u in users_query.all()]
 
     treatment_types = [{"id": t.id, "type_name": t.type_name} for t in db.query(TreatmentType).all()]
+    rules = [{"id": r.id, "rule_name": r.rule_name, "treatment_type_id": r.treatment_type_id,
+              "call_window": r.call_window.value if r.call_window else None} for r in db.query(CallbackRule).all()]
 
     return StatsFilterOptions(
         stores=stores,
         users=users,
-        treatment_types=treatment_types
+        treatment_types=treatment_types,
+        rules=rules
     )
 
 
@@ -129,6 +132,27 @@ def get_stats_overview(
 
     timeout_count = count_overdue_tasks(db, store_id=store_id, base_query=query)
 
+    review_total_query = query.filter(CallbackTask.is_abnormal == True)
+    rev_pending_doctor = review_total_query.filter(
+        (CallbackTask.status == TaskStatus.DOCTOR_REVIEW)
+        | (CallbackTask.review_status == ReviewStatus.PENDING_DOCTOR)
+    ).count()
+    rev_doctor_advised = review_total_query.filter(
+        (CallbackTask.review_status == ReviewStatus.DOCTOR_ADVISED)
+        | (
+            (CallbackTask.status == TaskStatus.DOCTOR_REVIEWED)
+            & (CallbackTask.review_status.is_(None))
+        )
+    ).count()
+    rev_pending_followup = review_total_query.filter(
+        CallbackTask.review_status == ReviewStatus.PENDING_FOLLOWUP
+    ).count()
+    rev_closed = review_total_query.filter(
+        CallbackTask.review_status == ReviewStatus.CLOSED
+    ).count()
+    rev_total = review_total_query.count()
+    rev_closure_rate = safe_div(rev_closed, rev_total) if rev_total > 0 else 0.0
+
     overview = StatsOverview(
         total_tasks=total,
         pending_tasks=status_counts.get(TaskStatus.PENDING, 0),
@@ -140,6 +164,11 @@ def get_stats_overview(
         timeout_tasks=timeout_count,
         doctor_review_tasks=status_counts.get(TaskStatus.DOCTOR_REVIEW, 0),
         doctor_reviewed_tasks=status_counts.get(TaskStatus.DOCTOR_REVIEWED, 0),
+        review_pending_doctor=rev_pending_doctor,
+        review_doctor_advised=rev_doctor_advised,
+        review_pending_followup=rev_pending_followup,
+        review_closed=rev_closed,
+        review_closure_rate=rev_closure_rate,
     )
     return overview
 
@@ -506,3 +535,116 @@ def get_timeout_count(
     )
     timeout_count = count_overdue_tasks(db, store_id=store_id, base_query=query)
     return {"timeout_count": timeout_count}
+
+
+@router.get("/rule-effect", response_model=List[RuleEffectItem])
+def get_rule_effect_analysis(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    store_id: Optional[int] = None,
+    treatment_type_id: Optional[int] = None,
+    rule_id: Optional[int] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_roles(UserRole.ADMIN, UserRole.STORE_NURSE))
+):
+    rules_query = db.query(CallbackRule).options(
+        joinedload(CallbackRule.treatment_type)
+    )
+    if treatment_type_id:
+        rules_query = rules_query.filter(CallbackRule.treatment_type_id == treatment_type_id)
+    if rule_id:
+        rules_query = rules_query.filter(CallbackRule.id == rule_id)
+    rules = rules_query.all()
+
+    results = []
+    for rule in rules:
+        query = db.query(CallbackTask).filter(CallbackTask.rule_id == rule.id)
+        query, _, _ = apply_stats_filter(
+            query, start_date, end_date, store_id, None, None, current_user
+        )
+
+        total = query.count()
+        if total == 0:
+            continue
+
+        abnormal = query.filter(CallbackTask.is_abnormal == True).count()
+        timeout = count_overdue_tasks(db, base_query=query)
+        doctor_review = query.filter(CallbackTask.status.in_([
+            TaskStatus.DOCTOR_REVIEW, TaskStatus.DOCTOR_REVIEWED
+        ])).count()
+
+        item = RuleEffectItem(
+            treatment_type_id=rule.treatment_type_id,
+            treatment_type_name=rule.treatment_type.type_name if rule.treatment_type else "",
+            rule_id=rule.id,
+            rule_name=rule.rule_name,
+            call_window=rule.call_window.value if rule.call_window else None,
+            total_tasks=total,
+            abnormal_tasks=abnormal,
+            abnormal_rate=safe_div(abnormal, total),
+            timeout_tasks=timeout,
+            timeout_rate=safe_div(timeout, total),
+            doctor_review_tasks=doctor_review,
+            doctor_review_rate=safe_div(doctor_review, total),
+        )
+        results.append(item)
+
+    results.sort(key=lambda x: x.abnormal_rate, reverse=True)
+    return results
+
+
+@router.get("/rule-effect/export/csv")
+def export_rule_effect_csv(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    store_id: Optional[int] = None,
+    treatment_type_id: Optional[int] = None,
+    rule_id: Optional[int] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_roles(UserRole.ADMIN, UserRole.STORE_NURSE))
+):
+    rules_query = db.query(CallbackRule).options(
+        joinedload(CallbackRule.treatment_type)
+    )
+    if treatment_type_id:
+        rules_query = rules_query.filter(CallbackRule.treatment_type_id == treatment_type_id)
+    if rule_id:
+        rules_query = rules_query.filter(CallbackRule.id == rule_id)
+    rules = rules_query.all()
+
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow([
+        "治疗类型", "回访规则", "拨打时段", "任务总数",
+        "异常数", "异常率(%)", "超时数", "超时率(%)", "转医生数", "转医生比例(%)"
+    ])
+    for rule in rules:
+        query = db.query(CallbackTask).filter(CallbackTask.rule_id == rule.id)
+        query, _, _ = apply_stats_filter(
+            query, start_date, end_date, store_id, None, None, current_user
+        )
+        total = query.count()
+        if total == 0:
+            continue
+        abnormal = query.filter(CallbackTask.is_abnormal == True).count()
+        timeout = count_overdue_tasks(db, base_query=query)
+        doctor_review = query.filter(CallbackTask.status.in_([
+            TaskStatus.DOCTOR_REVIEW, TaskStatus.DOCTOR_REVIEWED
+        ])).count()
+        writer.writerow([
+            rule.treatment_type.type_name if rule.treatment_type else "",
+            rule.rule_name,
+            rule.call_window.value if rule.call_window else "",
+            total,
+            abnormal, safe_div(abnormal, total),
+            timeout, safe_div(timeout, total),
+            doctor_review, safe_div(doctor_review, total),
+        ])
+
+    buffer.seek(0)
+    filename = f"规则效果分析_{datetime.now().strftime('%Y%m%d%H%M%S')}.csv"
+    return StreamingResponse(
+        iter([buffer.getvalue()]),
+        media_type="text/csv; charset=utf-8-sig",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )

@@ -1,7 +1,8 @@
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from datetime import datetime
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
+import json
 
 from ..models import User, UserRole, CallbackTask, TaskStatus, Patient, RiskLevel
 from ..models.task import CallbackTask
@@ -225,6 +226,12 @@ def auto_assign_pending_tasks(db: Session, limit: int = 50):
             task.assigned_at = datetime.utcnow()
             task.status = TaskStatus.ASSIGNED
             task.assignment_reason = detail.get("reason_summary", "")
+            detail["assigned_at"] = datetime.utcnow().isoformat()
+            detail["assignment_type"] = "auto"
+            try:
+                task.assignment_snapshot = json.dumps(detail, ensure_ascii=False)
+            except:
+                pass
             assigned_count += 1
 
     db.commit()
@@ -234,10 +241,17 @@ def auto_assign_pending_tasks(db: Session, limit: int = 50):
 def get_assignment_reason_detail(
     db: Session,
     task: CallbackTask
-) -> dict:
+) -> Tuple[dict, bool]:
+    if task.assignment_snapshot:
+        try:
+            snapshot = json.loads(task.assignment_snapshot)
+            return snapshot, True
+        except:
+            pass
+
     patient = task.patient
     if not patient:
-        return {"error": "患者信息缺失"}
+        return {"error": "患者信息缺失"}, False
 
     _, detail = pick_user_for_task(
         db,
@@ -245,4 +259,4 @@ def get_assignment_reason_detail(
         store_id=task.store_id,
         risk_level=patient.risk_level
     )
-    return detail
+    return detail, False

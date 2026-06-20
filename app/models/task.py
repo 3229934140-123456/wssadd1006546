@@ -18,6 +18,13 @@ class TaskStatus(str, enum.Enum):
     CANCELLED = "cancelled"
 
 
+class ReviewStatus(str, enum.Enum):
+    PENDING_DOCTOR = "pending_doctor"
+    DOCTOR_ADVISED = "doctor_advised"
+    PENDING_FOLLOWUP = "pending_followup"
+    CLOSED = "closed"
+
+
 class CallResult(str, enum.Enum):
     CONNECTED = "connected"
     NO_ANSWER = "no_answer"
@@ -61,12 +68,20 @@ class CallbackTask(Base):
     reassigned_reason = Column(String(200))
 
     assignment_reason = Column(String(500), comment="分派解释：风险、标签、负载等依据")
+    assignment_snapshot = Column(Text, comment="分派解释完整JSON快照，分派时留档不随后续变化")
 
     doctor_review_notes = Column(Text, comment="医生复核意见")
     doctor_conclusion = Column(String(50), comment="处理结论：正常观察/建议复诊/紧急处理/转上级医院")
     suggested_review_date = Column(Date, nullable=True, comment="建议复诊日期")
     reviewed_by_id = Column(Integer, ForeignKey("users.id"), nullable=True, comment="复核医生ID")
     reviewed_at = Column(DateTime, nullable=True, comment="复核完成时间")
+
+    review_status = Column(Enum(ReviewStatus), nullable=True, comment="复核协同状态")
+    nurse_followup_notes = Column(Text, comment="门店护士跟进结果")
+    followup_by_id = Column(Integer, ForeignKey("users.id"), nullable=True, comment="跟进护士ID")
+    followup_at = Column(DateTime, nullable=True, comment="跟进完成时间")
+    followup_result = Column(String(100), comment="跟进结果：已复诊/延期/失联/无需复诊")
+    actual_review_date = Column(Date, nullable=True, comment="实际复诊日期")
 
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -78,3 +93,4 @@ class CallbackTask(Base):
     assigned_user = relationship("User", foreign_keys=[assigned_user_id], back_populates="assigned_tasks")
     handled_by = relationship("User", foreign_keys=[handled_by_id], back_populates="handled_tasks")
     reviewed_by = relationship("User", foreign_keys=[reviewed_by_id])
+    followup_by = relationship("User", foreign_keys=[followup_by_id])
