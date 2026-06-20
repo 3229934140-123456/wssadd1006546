@@ -60,6 +60,14 @@ class CallbackTask(Base):
     reassigned_at = Column(DateTime, nullable=True)
     reassigned_reason = Column(String(200))
 
+    assignment_reason = Column(String(500), comment="分派解释：风险、标签、负载等依据")
+
+    doctor_review_notes = Column(Text, comment="医生复核意见")
+    doctor_conclusion = Column(String(50), comment="处理结论：正常观察/建议复诊/紧急处理/转上级医院")
+    suggested_review_date = Column(Date, nullable=True, comment="建议复诊日期")
+    reviewed_by_id = Column(Integer, ForeignKey("users.id"), nullable=True, comment="复核医生ID")
+    reviewed_at = Column(DateTime, nullable=True, comment="复核完成时间")
+
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -69,3 +77,4 @@ class CallbackTask(Base):
     rule = relationship("CallbackRule", back_populates="tasks")
     assigned_user = relationship("User", foreign_keys=[assigned_user_id], back_populates="assigned_tasks")
     handled_by = relationship("User", foreign_keys=[handled_by_id], back_populates="handled_tasks")
+    reviewed_by = relationship("User", foreign_keys=[reviewed_by_id])

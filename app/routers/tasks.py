@@ -1,9 +1,9 @@
-from typing import List, Optional
-from datetime import datetime
+from typing import List, Optional, Tuple
+from datetime import datetime, date, time
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from sqlalchemy.orm import joinedload
-from sqlalchemy import or_, and_
+from sqlalchemy import or_, and_, func
 
 from ..database import get_db
 from ..deps import get_current_user, require_roles
@@ -13,14 +13,16 @@ from ..models import (
 )
 from ..schemas.task import (
     GenerateTasksRequest, ReassignTaskRequest, HandleTaskRequest,
-    CompleteDoctorReviewRequest, CallbackTaskResponse, TaskListResponse
+    CompleteDoctorReviewRequest, CallbackTaskResponse, TaskListResponse,
+    TaskGroup, TaskGroupStats, GroupedTaskResponse, AssignmentReasonDetail
 )
 from ..services.task_pool_service import (
     generate_tasks_for_store, generate_tasks_by_record_ids,
-    check_and_mark_timeout_tasks
+    check_and_mark_timeout_tasks, apply_overdue_filter, FINISHED_STATUSES
 )
 from ..services.assignment_service import (
-    auto_assign_pending_tasks, assign_task_to_user, pick_doctor_for_task, find_assignable_users
+    auto_assign_pending_tasks, assign_task_to_user, pick_doctor_for_task,
+    find_assignable_users, get_assignment_reason_detail
 )
 from ..services.keyword_service import (
     parse_keywords, detect_abnormal_keywords, DEFAULT_ABNORMAL_KEYWORDS
@@ -82,47 +84,53 @@ def _apply_default_filter(
     status: Optional[TaskStatus],
     scheduled_date_from: Optional[str],
     scheduled_date_to: Optional[str],
+    scheduled_time_from: Optional[str] = None,
+    scheduled_time_to: Optional[str] = None,
 ):
     has_explicit_filter = (
         status is not None
         or scheduled_date_from is not None
         or scheduled_date_to is not None
+        or scheduled_time_from is not None
+        or scheduled_time_to is not None
     )
     if not has_explicit_filter:
-        today = datetime.utcnow().date()
+        now = datetime.utcnow()
+        today = now.date()
+        current_time = now.time()
         query = query.filter(
             (
                 (CallbackTask.status.in_(_get_pending_statuses()))
                 & (CallbackTask.scheduled_date <= today)
+                & (
+                    (CallbackTask.scheduled_date < today)
+                    | (
+                        (CallbackTask.scheduled_date == today)
+                        & (
+                            (CallbackTask.scheduled_time.is_(None))
+                            | (CallbackTask.scheduled_time <= current_time)
+                        )
+                    )
+                )
             )
             | (CallbackTask.status == TaskStatus.DOCTOR_REVIEW)
         )
     return query
 
 
-@router.get("", response_model=TaskListResponse)
-def list_tasks(
-    status: Optional[TaskStatus] = None,
+def _apply_base_scope(
+    query,
+    current_user: User,
     store_id: Optional[int] = None,
     assigned_user_id: Optional[int] = None,
-    patient_keyword: Optional[str] = None,
-    scheduled_date_from: Optional[str] = None,
-    scheduled_date_to: Optional[str] = None,
-    page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=100),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
 ):
-    query = db.query(CallbackTask).options(
-        joinedload(CallbackTask.patient),
-        joinedload(CallbackTask.store),
-        joinedload(CallbackTask.rule),
-        joinedload(CallbackTask.treatment_record).joinedload(TreatmentRecord.treatment_type),
-        joinedload(CallbackTask.assigned_user),
-    )
-
     if current_user.role == UserRole.CALL_AGENT:
         query = query.filter(CallbackTask.assigned_user_id == current_user.id)
+    elif current_user.role == UserRole.STORE_NURSE:
+        query = query.filter(
+            (CallbackTask.assigned_user_id == current_user.id)
+            | (CallbackTask.store_id == current_user.store_id)
+        )
     elif current_user.role == UserRole.DOCTOR:
         query = query.filter(
             (CallbackTask.assigned_user_id == current_user.id)
@@ -134,14 +142,28 @@ def list_tasks(
     elif current_user.role != UserRole.ADMIN and current_user.store_id:
         query = query.filter(CallbackTask.store_id == current_user.store_id)
 
-    query = _apply_default_filter(query, status, scheduled_date_from, scheduled_date_to)
-
-    if status:
-        query = query.filter(CallbackTask.status == status)
     if store_id and (current_user.role == UserRole.ADMIN or not current_user.store_id):
         query = query.filter(CallbackTask.store_id == store_id)
     if assigned_user_id:
         query = query.filter(CallbackTask.assigned_user_id == assigned_user_id)
+    return query
+
+
+def _apply_common_filters(
+    query,
+    status: Optional[TaskStatus] = None,
+    patient_keyword: Optional[str] = None,
+    scheduled_date_from: Optional[str] = None,
+    scheduled_date_to: Optional[str] = None,
+    scheduled_time_from: Optional[str] = None,
+    scheduled_time_to: Optional[str] = None,
+    treatment_type_id: Optional[int] = None,
+    is_overdue: Optional[bool] = None,
+):
+    from datetime import datetime
+
+    if status:
+        query = query.filter(CallbackTask.status == status)
     if patient_keyword:
         like = f"%{patient_keyword}%"
         query = query.join(Patient).filter(
@@ -159,11 +181,204 @@ def list_tasks(
             query = query.filter(CallbackTask.scheduled_date <= d)
         except:
             pass
+    if scheduled_time_from:
+        try:
+            t = datetime.strptime(scheduled_time_from, "%H:%M:%S").time()
+            query = query.filter(CallbackTask.scheduled_time >= t)
+        except:
+            pass
+    if scheduled_time_to:
+        try:
+            t = datetime.strptime(scheduled_time_to, "%H:%M:%S").time()
+            query = query.filter(CallbackTask.scheduled_time <= t)
+        except:
+            pass
+    if treatment_type_id:
+        query = query.join(TreatmentRecord).filter(
+            TreatmentRecord.treatment_type_id == treatment_type_id
+        )
+    if is_overdue:
+        query = apply_overdue_filter(query)
+    return query
+
+
+def _apply_group_filter(
+    query,
+    group: Optional[TaskGroup],
+    now: Optional[datetime] = None
+) -> Tuple:
+    if now is None:
+        now = datetime.utcnow()
+    today = now.date()
+    current_time = now.time()
+
+    base_query = query.filter(
+        (CallbackTask.status.in_(_get_pending_statuses()))
+        & (CallbackTask.status.not_in(FINISHED_STATUSES))
+    )
+
+    if group == TaskGroup.OVERDUE:
+        query = apply_overdue_filter(base_query, now)
+    elif group == TaskGroup.NOW:
+        query = base_query.filter(
+            (
+                (CallbackTask.scheduled_date < today)
+                | (
+                    (CallbackTask.scheduled_date == today)
+                    & (
+                        (CallbackTask.scheduled_time.is_(None))
+                        | (CallbackTask.scheduled_time <= current_time)
+                    )
+                )
+            )
+            & (
+                (CallbackTask.due_time.is_(None))
+                | (CallbackTask.due_time >= now)
+            )
+        )
+    elif group == TaskGroup.LATER:
+        query = base_query.filter(
+            (CallbackTask.scheduled_date == today)
+            & (CallbackTask.scheduled_time > current_time)
+        )
+    else:
+        return base_query
+
+    return query
+
+
+@router.get("/grouped", response_model=GroupedTaskResponse)
+def get_grouped_tasks(
+    group: Optional[TaskGroup] = Query(TaskGroup.NOW),
+    store_id: Optional[int] = None,
+    assigned_user_id: Optional[int] = None,
+    patient_keyword: Optional[str] = None,
+    treatment_type_id: Optional[int] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    now = datetime.utcnow()
+    today = now.date()
+    current_time = now.time()
+
+    base_query = db.query(CallbackTask).options(
+        joinedload(CallbackTask.patient),
+        joinedload(CallbackTask.store),
+        joinedload(CallbackTask.rule),
+        joinedload(CallbackTask.treatment_record).joinedload(TreatmentRecord.treatment_type),
+        joinedload(CallbackTask.assigned_user),
+    )
+
+    base_query = _apply_base_scope(base_query, current_user, store_id, assigned_user_id)
+    base_query = _apply_common_filters(
+        base_query,
+        patient_keyword=patient_keyword,
+        treatment_type_id=treatment_type_id,
+    )
+
+    pending_query = base_query.filter(
+        (CallbackTask.status.in_(_get_pending_statuses()))
+        & (CallbackTask.status.not_in(FINISHED_STATUSES))
+    )
+
+    now_count_query = pending_query.filter(
+        (
+            (CallbackTask.scheduled_date < today)
+            | (
+                (CallbackTask.scheduled_date == today)
+                & (
+                    (CallbackTask.scheduled_time.is_(None))
+                    | (CallbackTask.scheduled_time <= current_time)
+                )
+            )
+        )
+        & (
+            (CallbackTask.due_time.is_(None))
+            | (CallbackTask.due_time >= now)
+        )
+    )
+    now_count = now_count_query.count()
+
+    later_count = pending_query.filter(
+        (CallbackTask.scheduled_date == today)
+        & (CallbackTask.scheduled_time > current_time)
+    ).count()
+
+    overdue_count = apply_overdue_filter(pending_query, now).count()
+
+    list_query = _apply_group_filter(base_query, group, now)
+    list_query = _apply_common_filters(
+        list_query,
+        patient_keyword=patient_keyword,
+        treatment_type_id=treatment_type_id,
+    )
+
+    total = list_query.count()
+    items = list_query.order_by(
+        CallbackTask.priority.desc(),
+        CallbackTask.scheduled_date.asc(),
+        CallbackTask.scheduled_time.asc().nullslast(),
+        CallbackTask.created_at.asc()
+    ).offset((page - 1) * page_size).limit(page_size).all()
+
+    stats = TaskGroupStats(
+        now_count=now_count,
+        later_count=later_count,
+        overdue_count=overdue_count,
+        active_group=group
+    )
+    tasks = TaskListResponse(items=items, total=total, page=page, page_size=page_size)
+    return GroupedTaskResponse(stats=stats, tasks=tasks)
+
+
+@router.get("", response_model=TaskListResponse)
+def list_tasks(
+    status: Optional[TaskStatus] = None,
+    store_id: Optional[int] = None,
+    assigned_user_id: Optional[int] = None,
+    patient_keyword: Optional[str] = None,
+    scheduled_date_from: Optional[str] = None,
+    scheduled_date_to: Optional[str] = None,
+    scheduled_time_from: Optional[str] = None,
+    scheduled_time_to: Optional[str] = None,
+    treatment_type_id: Optional[int] = None,
+    is_overdue: Optional[bool] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    query = db.query(CallbackTask).options(
+        joinedload(CallbackTask.patient),
+        joinedload(CallbackTask.store),
+        joinedload(CallbackTask.rule),
+        joinedload(CallbackTask.treatment_record).joinedload(TreatmentRecord.treatment_type),
+        joinedload(CallbackTask.assigned_user),
+        joinedload(CallbackTask.reviewed_by),
+    )
+
+    query = _apply_base_scope(query, current_user, store_id, assigned_user_id)
+    query = _apply_default_filter(query, status, scheduled_date_from, scheduled_date_to,
+                                  scheduled_time_from, scheduled_time_to)
+    query = _apply_common_filters(
+        query,
+        status=status,
+        patient_keyword=patient_keyword,
+        scheduled_date_from=scheduled_date_from,
+        scheduled_date_to=scheduled_date_to,
+        scheduled_time_from=scheduled_time_from,
+        scheduled_time_to=scheduled_time_to,
+        treatment_type_id=treatment_type_id,
+        is_overdue=is_overdue,
+    )
 
     total = query.count()
     items = query.order_by(
         CallbackTask.priority.desc(),
         CallbackTask.scheduled_date.asc(),
+        CallbackTask.scheduled_time.asc().nullslast(),
         CallbackTask.created_at.asc()
     ).offset((page - 1) * page_size).limit(page_size).all()
 
@@ -183,6 +398,7 @@ def get_task(
         joinedload(CallbackTask.treatment_record).joinedload(TreatmentRecord.treatment_type),
         joinedload(CallbackTask.assigned_user),
         joinedload(CallbackTask.handled_by),
+        joinedload(CallbackTask.reviewed_by),
     ).filter(CallbackTask.id == task_id).first()
     if not task:
         raise HTTPException(status_code=404, detail="任务不存在")
@@ -192,7 +408,7 @@ def get_task(
         can_see = (
             task.assigned_user_id == current_user.id
             or (
-                task.status == TaskStatus.DOCTOR_REVIEW
+                task.status in [TaskStatus.DOCTOR_REVIEW, TaskStatus.DOCTOR_REVIEWED]
                 and task.store_id == current_user.store_id
             )
         )
@@ -201,6 +417,24 @@ def get_task(
     elif current_user.role not in [UserRole.ADMIN, UserRole.STORE_NURSE] and task.store_id != current_user.store_id:
         raise HTTPException(status_code=403, detail="无权查看其他门店任务")
     return task
+
+
+@router.get("/{task_id}/assignment-reason", response_model=AssignmentReasonDetail)
+def get_task_assignment_reason(
+    task_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_roles(UserRole.ADMIN, UserRole.STORE_NURSE))
+):
+    task = db.query(CallbackTask).options(
+        joinedload(CallbackTask.patient),
+    ).filter(CallbackTask.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    if current_user.role != UserRole.ADMIN and task.store_id != current_user.store_id:
+        raise HTTPException(status_code=403, detail="无权查看其他门店任务")
+
+    detail = get_assignment_reason_detail(db, task)
+    return detail
 
 
 @router.post("/{task_id}/start", response_model=CallbackTaskResponse)
@@ -214,7 +448,7 @@ def start_task(
         raise HTTPException(status_code=404, detail="任务不存在")
     if task.assigned_user_id != current_user.id:
         raise HTTPException(status_code=403, detail="只能开始分配给自己的任务")
-    if task.status not in [TaskStatus.ASSIGNED, TaskStatus.IN_PROGRESS]:
+    if task.status not in [TaskStatus.ASSIGNED, TaskStatus.IN_PROGRESS, TaskStatus.TIMEOUT]:
         raise HTTPException(status_code=400, detail=f"任务状态为 {task.status.value}，无法开始")
     task.status = TaskStatus.IN_PROGRESS
     db.commit()
@@ -235,7 +469,7 @@ def handle_task(
         raise HTTPException(status_code=404, detail="任务不存在")
     if task.assigned_user_id != current_user.id:
         raise HTTPException(status_code=403, detail="只能处理分配给自己的任务")
-    if task.status not in [TaskStatus.ASSIGNED, TaskStatus.IN_PROGRESS]:
+    if task.status not in [TaskStatus.ASSIGNED, TaskStatus.IN_PROGRESS, TaskStatus.TIMEOUT]:
         raise HTTPException(status_code=400, detail=f"任务状态为 {task.status.value}，无法处理")
 
     task.call_result = req.call_result
@@ -295,12 +529,24 @@ def complete_doctor_review(
         raise HTTPException(status_code=403, detail="只能复核分配给自己的任务")
 
     task.status = TaskStatus.DOCTOR_REVIEWED
+    task.doctor_review_notes = req.review_notes
+    task.doctor_conclusion = req.doctor_conclusion
+    task.suggested_review_date = req.suggested_review_date
+    task.reviewed_by_id = current_user.id
+    task.reviewed_at = datetime.utcnow()
     task.handled_by_id = current_user.id
     task.handled_at = datetime.utcnow()
+
+    summary_parts = []
     if task.callback_notes:
-        task.callback_notes = task.callback_notes + "\n\n【医生复核意见】\n" + req.review_notes
-    else:
-        task.callback_notes = "【医生复核意见】\n" + req.review_notes
+        summary_parts.append(task.callback_notes)
+    summary_parts.append("\n\n【医生复核意见】")
+    if req.doctor_conclusion:
+        summary_parts.append(f"处理结论：{req.doctor_conclusion}")
+    if req.suggested_review_date:
+        summary_parts.append(f"建议复诊：{req.suggested_review_date.strftime('%Y-%m-%d')}")
+    summary_parts.append(f"医生意见：{req.review_notes}")
+    task.callback_notes = "\n".join(summary_parts)
 
     db.commit()
     db.refresh(task)
@@ -330,4 +576,5 @@ def get_assignable_users(
     if current_user.role != UserRole.ADMIN and current_user.store_id:
         store_id = current_user.store_id
     users = find_assignable_users(db, store_id)
-    return [{"id": u.id, "real_name": u.real_name, "username": u.username, "role": u.role.value, "store_id": u.store_id} for u in users]
+    return [{"id": u.id, "real_name": u.real_name, "full_name": u.real_name or u.real_name,
+             "username": u.username, "role": u.role.value, "store_id": u.store_id} for u in users]

@@ -1,7 +1,14 @@
 from pydantic import BaseModel, ConfigDict
 from datetime import datetime, date, time
-from typing import Optional
+from typing import Optional, List
+from enum import Enum
 from ..models.task import TaskStatus, CallResult
+
+
+class TaskGroup(str, Enum):
+    NOW = "now"
+    LATER = "later"
+    OVERDUE = "overdue"
 
 
 class CallbackTaskBase(BaseModel):
@@ -30,6 +37,17 @@ class HandleTaskRequest(BaseModel):
 class CompleteDoctorReviewRequest(BaseModel):
     task_id: int
     review_notes: str
+    doctor_conclusion: Optional[str] = None
+    suggested_review_date: Optional[date] = None
+
+
+class AssignmentReasonDetail(BaseModel):
+    patient_risk_level: str
+    patient_risk_tags: Optional[str] = None
+    has_special_tags: bool
+    candidate_scores: List[dict]
+    final_decision: str
+    reason_summary: str
 
 
 class CallbackTaskResponse(BaseModel):
@@ -57,6 +75,12 @@ class CallbackTaskResponse(BaseModel):
     reassigned_from_id: Optional[int] = None
     reassigned_at: Optional[datetime] = None
     reassigned_reason: Optional[str] = None
+    assignment_reason: Optional[str] = None
+    doctor_review_notes: Optional[str] = None
+    doctor_conclusion: Optional[str] = None
+    suggested_review_date: Optional[date] = None
+    reviewed_by_id: Optional[int] = None
+    reviewed_at: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
     patient: Optional["PatientResponse"] = None
@@ -64,6 +88,7 @@ class CallbackTaskResponse(BaseModel):
     rule: Optional["CallbackRuleResponse"] = None
     treatment_record: Optional["TreatmentRecordResponse"] = None
     assigned_user: Optional["UserResponse"] = None
+    reviewed_by: Optional["UserResponse"] = None
 
 
 from .patient import PatientResponse
@@ -79,3 +104,16 @@ class TaskListResponse(BaseModel):
     total: int
     page: int
     page_size: int
+
+
+class TaskGroupStats(BaseModel):
+    now_count: int = 0
+    later_count: int = 0
+    overdue_count: int = 0
+    active_group: TaskGroup = TaskGroup.NOW
+
+
+class GroupedTaskResponse(BaseModel):
+    stats: TaskGroupStats
+    tasks: TaskListResponse
+

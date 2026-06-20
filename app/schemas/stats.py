@@ -1,6 +1,6 @@
 from pydantic import BaseModel
-from datetime import date
-from typing import Optional
+from datetime import date, datetime
+from typing import Optional, List
 from enum import Enum
 
 
@@ -46,8 +46,26 @@ class TimeoutTaskItem(BaseModel):
     phone: str
     store_name: str
     scheduled_date: date
+    due_time: Optional[datetime] = None
     status: str
     overdue_hours: float
+    treatment_type: Optional[str] = None
+    assigned_user: Optional[str] = None
+
+
+class AbnormalTaskItem(BaseModel):
+    task_id: int
+    task_no: str
+    patient_name: str
+    phone: str
+    store_name: str
+    scheduled_date: date
+    status: str
+    abnormal_keywords_hit: Optional[str] = None
+    treatment_type: Optional[str] = None
+    assigned_user: Optional[str] = None
+    doctor_review_notes: Optional[str] = None
+    doctor_conclusion: Optional[str] = None
 
 
 class StatsOverview(BaseModel):
@@ -61,3 +79,9 @@ class StatsOverview(BaseModel):
     timeout_tasks: int = 0
     doctor_review_tasks: int = 0
     doctor_reviewed_tasks: int = 0
+
+
+class StatsFilterOptions(BaseModel):
+    stores: List[dict] = []
+    users: List[dict] = []
+    treatment_types: List[dict] = []
