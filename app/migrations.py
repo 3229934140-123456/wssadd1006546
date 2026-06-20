@@ -47,4 +47,33 @@ def run_migrations():
                         logger.warning(f"迁移字段 {col_name} 时出现警告: {e}")
                         conn.rollback()
 
+        if "patient_abnormal_history" not in tables:
+            try:
+                conn.execute(text("""
+                    CREATE TABLE patient_abnormal_history (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        patient_id INTEGER NOT NULL,
+                        task_id INTEGER NOT NULL,
+                        store_id INTEGER,
+                        abnormal_keywords_hit VARCHAR(500),
+                        callback_notes TEXT,
+                        doctor_review_notes TEXT,
+                        doctor_conclusion VARCHAR(50),
+                        suggested_review_date DATE,
+                        nurse_followup_notes TEXT,
+                        followup_result VARCHAR(100),
+                        actual_review_date DATE,
+                        closure_reason VARCHAR(200),
+                        created_at DATETIME,
+                        closed_at DATETIME
+                    )
+                """))
+                conn.execute(text("CREATE INDEX idx_pah_patient_id ON patient_abnormal_history(patient_id)"))
+                conn.execute(text("CREATE INDEX idx_pah_task_id ON patient_abnormal_history(task_id)"))
+                conn.commit()
+                logger.info("迁移：创建 patient_abnormal_history 表")
+            except Exception as e:
+                logger.warning(f"创建 patient_abnormal_history 表失败: {e}")
+                conn.rollback()
+
         logger.info("数据库迁移完成")

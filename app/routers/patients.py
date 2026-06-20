@@ -4,8 +4,8 @@ from sqlalchemy.orm import Session
 
 from ..database import get_db
 from ..deps import get_current_user, require_roles
-from ..models import Patient, Store, User, UserRole
-from ..schemas.patient import PatientCreate, PatientUpdate, PatientResponse
+from ..models import Patient, Store, User, UserRole, PatientAbnormalHistory
+from ..schemas.patient import PatientCreate, PatientUpdate, PatientResponse, PatientDetailResponse
 
 router = APIRouter(prefix="/api/patients", tags=["患者管理"])
 
@@ -57,7 +57,7 @@ def create_patient(
     return db_patient
 
 
-@router.get("/{patient_id}", response_model=PatientResponse)
+@router.get("/{patient_id}", response_model=PatientDetailResponse)
 def get_patient(
     patient_id: int,
     db: Session = Depends(get_db),
@@ -68,7 +68,14 @@ def get_patient(
         raise HTTPException(status_code=404, detail="患者不存在")
     if current_user.role != UserRole.ADMIN and patient.store_id != current_user.store_id:
         raise HTTPException(status_code=403, detail="无权查看其他门店患者")
-    return patient
+
+    history = db.query(PatientAbnormalHistory).filter(
+        PatientAbnormalHistory.patient_id == patient_id
+    ).order_by(PatientAbnormalHistory.closed_at.desc()).limit(10).all()
+
+    patient_dict = {c.name: getattr(patient, c.name) for c in Patient.__table__.columns}
+    patient_dict["abnormal_history"] = history
+    return patient_dict
 
 
 @router.put("/{patient_id}", response_model=PatientResponse)

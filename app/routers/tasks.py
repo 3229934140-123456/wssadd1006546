@@ -9,7 +9,8 @@ from ..database import get_db
 from ..deps import get_current_user, require_roles
 from ..models import (
     CallbackTask, TaskStatus, CallResult, User, UserRole,
-    Patient, TreatmentRecord, CallbackRule, Store, ReviewStatus
+    Patient, TreatmentRecord, CallbackRule, Store, ReviewStatus,
+    PatientAbnormalHistory
 )
 from ..schemas.task import (
     GenerateTasksRequest, ReassignTaskRequest, HandleTaskRequest,
@@ -19,7 +20,9 @@ from ..schemas.task import (
 )
 from ..services.task_pool_service import (
     generate_tasks_for_store, generate_tasks_by_record_ids,
-    check_and_mark_timeout_tasks, apply_overdue_filter, FINISHED_STATUSES
+    check_and_mark_timeout_tasks, apply_overdue_filter, FINISHED_STATUSES,
+    count_doctor_overdue, count_followup_overdue, decorate_task_overdue,
+    is_doctor_overdue, is_followup_overdue
 )
 from ..services.assignment_service import (
     auto_assign_pending_tasks, assign_task_to_user, pick_doctor_for_task,
@@ -30,6 +33,31 @@ from ..services.keyword_service import (
 )
 
 router = APIRouter(prefix="/api/tasks", tags=["坐席任务"])
+
+
+def _save_patient_abnormal_history(db: Session, task: CallbackTask, closure_reason: str):
+    exists = db.query(PatientAbnormalHistory).filter(
+        PatientAbnormalHistory.task_id == task.id
+    ).first()
+    if exists:
+        return
+    record = PatientAbnormalHistory(
+        patient_id=task.patient_id,
+        task_id=task.id,
+        store_id=task.store_id,
+        abnormal_keywords_hit=task.abnormal_keywords_hit,
+        callback_notes=task.callback_notes,
+        doctor_review_notes=task.doctor_review_notes,
+        doctor_conclusion=task.doctor_conclusion,
+        suggested_review_date=task.suggested_review_date,
+        nurse_followup_notes=task.nurse_followup_notes,
+        followup_result=task.followup_result,
+        actual_review_date=task.actual_review_date,
+        closure_reason=closure_reason,
+        closed_at=datetime.utcnow(),
+    )
+    db.add(record)
+    db.flush()
 
 
 @router.post("/generate", response_model=List[CallbackTaskResponse])
@@ -420,8 +448,9 @@ def get_task(
         )
         if not can_see:
             raise HTTPException(status_code=403, detail="无权查看其他门店的复核任务")
-    elif current_user.role not in [UserRole.ADMIN, UserRole.STORE_NURSE] and task.store_id != current_user.store_id:
+    if current_user.role not in [UserRole.ADMIN, UserRole.STORE_NURSE] and task.store_id != current_user.store_id:
         raise HTTPException(status_code=403, detail="无权查看其他门店任务")
+    decorate_task_overdue(task)
     return task
 
 
@@ -547,8 +576,9 @@ def complete_doctor_review(
 
     if req.doctor_conclusion in ["正常观察", "无需复诊"] or not req.suggested_review_date:
         task.review_status = ReviewStatus.CLOSED
+        _save_patient_abnormal_history(db, task, f"医生结论：{req.doctor_conclusion or '无需复诊'}")
     else:
-        task.review_status = ReviewStatus.PENDING_FOLLOWUP
+        task.review_status = ReviewStatus.DOCTOR_ADVISED
 
     summary_parts = []
     if task.callback_notes:
@@ -626,6 +656,8 @@ def get_review_collaboration_stats(
     closed = query.filter(CallbackTask.review_status == ReviewStatus.CLOSED).count()
 
     closure_rate = round(closed * 100.0 / total, 2) if total > 0 else 0.0
+    doc_overdue = count_doctor_overdue(db, store_id=store_id, base_query=query)
+    follow_overdue = count_followup_overdue(db, store_id=store_id, base_query=query)
 
     return ReviewCollaborationStats(
         pending_doctor=pending_doctor,
@@ -633,7 +665,9 @@ def get_review_collaboration_stats(
         pending_followup=pending_followup,
         closed=closed,
         total=total,
-        closure_rate=closure_rate
+        closure_rate=closure_rate,
+        doctor_overdue_count=doc_overdue,
+        followup_overdue_count=follow_overdue,
     )
 
 
@@ -713,6 +747,10 @@ def list_review_collaboration_tasks(
         CallbackTask.created_at.desc()
     ).offset((page - 1) * page_size).limit(page_size).all()
 
+    now = datetime.utcnow()
+    for t in items:
+        decorate_task_overdue(t, now)
+
     return TaskListResponse(items=items, total=total, page=page, page_size=page_size)
 
 
@@ -739,6 +777,7 @@ def nurse_followup(
 
     if req.close_review or req.followup_result in ["已复诊", "无需复诊", "已失联"]:
         task.review_status = ReviewStatus.CLOSED
+        _save_patient_abnormal_history(db, task, f"护士跟进结果：{req.followup_result or '手动关闭'}")
     else:
         task.review_status = ReviewStatus.PENDING_FOLLOWUP
 

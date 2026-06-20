@@ -76,7 +76,7 @@ class RuleEffectItem(BaseModel):
     treatment_type_name: str
     rule_id: int
     rule_name: str
-    call_window: Optional[str] = None
+    call_time_window: Optional[str] = None
     total_tasks: int = 0
     abnormal_tasks: int = 0
     abnormal_rate: float = 0.0
@@ -102,6 +102,8 @@ class StatsOverview(BaseModel):
     review_pending_followup: int = 0
     review_closed: int = 0
     review_closure_rate: float = 0.0
+    review_doctor_overdue: int = 0
+    review_followup_overdue: int = 0
 
 
 class StatsFilterOptions(BaseModel):

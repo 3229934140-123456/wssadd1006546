@@ -2,6 +2,7 @@ from pydantic import BaseModel, ConfigDict
 from datetime import datetime
 from typing import Optional, List
 from ..models.patient import RiskLevel, Gender
+from .patient_abnormal_history import PatientAbnormalHistoryItem
 
 
 class PatientBase(BaseModel):
@@ -37,4 +38,4 @@ class PatientResponse(PatientBase):
 
 
 class PatientDetailResponse(PatientResponse):
-    pass
+    abnormal_history: Optional[List[PatientAbnormalHistoryItem]] = None

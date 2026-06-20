@@ -1,10 +1,10 @@
 from typing import List, Optional
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from sqlalchemy.orm import Session
 
 from ..models import (
     CallbackTask, TaskStatus, TreatmentRecord, CallbackRule,
-    Patient, TreatmentType, User, UserRole
+    Patient, TreatmentType, User, UserRole, ReviewStatus
 )
 from .keyword_service import (
     calculate_scheduled_time, calculate_due_time, generate_task_no
@@ -149,4 +149,73 @@ def count_overdue_tasks(db: Session, store_id: Optional[int] = None, base_query=
     if store_id:
         base_query = base_query.filter(CallbackTask.store_id == store_id)
     return apply_overdue_filter(base_query).count()
+
+
+DOCTOR_REVIEW_SLA_HOURS = 24
+
+
+def is_doctor_overdue(task: CallbackTask, now: Optional[datetime] = None) -> bool:
+    if now is None:
+        now = datetime.utcnow()
+    if task.status != TaskStatus.DOCTOR_REVIEW and task.review_status != ReviewStatus.PENDING_DOCTOR:
+        return False
+    start_at = task.reassigned_at or task.assigned_at or task.created_at
+    if not start_at:
+        return False
+    delta = now - start_at
+    return delta.total_seconds() > DOCTOR_REVIEW_SLA_HOURS * 3600
+
+
+def is_followup_overdue(task: CallbackTask, now: Optional[datetime] = None) -> bool:
+    if now is None:
+        now = datetime.utcnow()
+    if task.review_status not in [ReviewStatus.DOCTOR_ADVISED, ReviewStatus.PENDING_FOLLOWUP]:
+        return False
+    if not task.suggested_review_date:
+        return False
+    return now.date() > task.suggested_review_date
+
+
+def count_doctor_overdue(db: Session, store_id: Optional[int] = None, base_query=None) -> int:
+    if base_query is None:
+        base_query = db.query(CallbackTask)
+    if store_id:
+        base_query = base_query.filter(CallbackTask.store_id == store_id)
+    now = datetime.utcnow()
+    from sqlalchemy import and_, or_
+    threshold = now - timedelta(hours=DOCTOR_REVIEW_SLA_HOURS)
+    base_query = base_query.filter(
+        or_(
+            CallbackTask.status == TaskStatus.DOCTOR_REVIEW,
+            CallbackTask.review_status == ReviewStatus.PENDING_DOCTOR
+        )
+    ).filter(
+        or_(
+            and_(CallbackTask.reassigned_at.isnot(None), CallbackTask.reassigned_at < threshold),
+            and_(CallbackTask.reassigned_at.is_(None), CallbackTask.assigned_at.isnot(None), CallbackTask.assigned_at < threshold),
+            and_(CallbackTask.reassigned_at.is_(None), CallbackTask.assigned_at.is_(None), CallbackTask.created_at < threshold),
+        )
+    )
+    return base_query.count()
+
+
+def count_followup_overdue(db: Session, store_id: Optional[int] = None, base_query=None) -> int:
+    if base_query is None:
+        base_query = db.query(CallbackTask)
+    if store_id:
+        base_query = base_query.filter(CallbackTask.store_id == store_id)
+    today = datetime.utcnow().date()
+    base_query = base_query.filter(
+        CallbackTask.review_status.in_([ReviewStatus.DOCTOR_ADVISED, ReviewStatus.PENDING_FOLLOWUP])
+    ).filter(
+        CallbackTask.suggested_review_date.isnot(None),
+        CallbackTask.suggested_review_date < today
+    )
+    return base_query.count()
+
+
+def decorate_task_overdue(task_obj, now: Optional[datetime] = None):
+    setattr(task_obj, "is_doctor_overdue", is_doctor_overdue(task_obj, now))
+    setattr(task_obj, "is_followup_overdue", is_followup_overdue(task_obj, now))
+    return task_obj
 

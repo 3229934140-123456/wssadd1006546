@@ -66,6 +66,8 @@ class ReviewCollaborationStats(BaseModel):
     closed: int = 0
     total: int = 0
     closure_rate: float = 0.0
+    doctor_overdue_count: int = 0
+    followup_overdue_count: int = 0
 
 
 class CallbackTaskResponse(BaseModel):
@@ -115,6 +117,8 @@ class CallbackTaskResponse(BaseModel):
     assigned_user: Optional["UserResponse"] = None
     reviewed_by: Optional["UserResponse"] = None
     followup_by: Optional["UserResponse"] = None
+    is_doctor_overdue: Optional[bool] = None
+    is_followup_overdue: Optional[bool] = None
 
 
 from .patient import PatientResponse
