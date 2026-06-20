@@ -124,3 +124,29 @@ def check_and_mark_timeout_tasks(db: Session) -> int:
     if count > 0:
         db.commit()
     return count
+
+
+FINISHED_STATUSES = [
+    TaskStatus.COMPLETED,
+    TaskStatus.DOCTOR_REVIEWED,
+    TaskStatus.CANCELLED,
+]
+
+
+def apply_overdue_filter(query, now: Optional[datetime] = None):
+    if now is None:
+        now = datetime.utcnow()
+    return query.filter(
+        (CallbackTask.due_time.isnot(None))
+        & (CallbackTask.due_time < now)
+        & (CallbackTask.status.not_in(FINISHED_STATUSES))
+    )
+
+
+def count_overdue_tasks(db: Session, store_id: Optional[int] = None, base_query=None) -> int:
+    if base_query is None:
+        base_query = db.query(CallbackTask)
+    if store_id:
+        base_query = base_query.filter(CallbackTask.store_id == store_id)
+    return apply_overdue_filter(base_query).count()
+

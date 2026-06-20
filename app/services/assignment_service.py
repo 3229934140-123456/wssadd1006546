@@ -1,18 +1,34 @@
 from typing import List, Optional
 from datetime import datetime
 from sqlalchemy.orm import Session
+from sqlalchemy import or_
 
 from ..models import User, UserRole, CallbackTask, TaskStatus, Patient, RiskLevel
 from ..models.task import CallbackTask
-from .keyword_service import generate_task_no
+from .keyword_service import generate_task_no, parse_keywords
+
+
+def has_special_risk_tags(patient: Patient) -> bool:
+    if not patient.risk_tags:
+        return False
+    tags = parse_keywords(patient.risk_tags)
+    special_keywords = ["高血压", "糖尿病", "心脏病", "过敏", "孕妇", "长期服药"]
+    for tag in tags:
+        for kw in special_keywords:
+            if kw in tag:
+                return True
+    return False
 
 
 def find_assignable_users(db: Session, store_id: Optional[int] = None) -> List[User]:
     query = db.query(User).filter(User.is_active == True)
     if store_id:
         query = query.filter(
-            (User.store_id == store_id) &
-            (User.role.in_([UserRole.CALL_AGENT, UserRole.STORE_NURSE]))
+            or_(
+                (User.role == UserRole.STORE_NURSE) & (User.store_id == store_id),
+                (User.role == UserRole.CALL_AGENT) & (User.store_id.is_(None)),
+                (User.role == UserRole.CALL_AGENT) & (User.store_id == store_id),
+            )
         )
     else:
         query = query.filter(User.role.in_([UserRole.CALL_AGENT, UserRole.STORE_NURSE]))
@@ -53,16 +69,42 @@ def pick_user_for_task(
     if not users:
         return None
 
+    has_special = has_special_risk_tags(patient)
+
     candidates = []
     for u in users:
         pending, done = calculate_user_load_score(db, u.id)
         score = pending * 10 - done
-        if u.role == UserRole.STORE_NURSE and u.store_id == store_id:
-            score -= 5
-        if risk_level == RiskLevel.HIGH and u.role == UserRole.STORE_NURSE:
-            score -= 8
-        if risk_level == RiskLevel.LOW and u.role == UserRole.CALL_AGENT:
-            score -= 3
+
+        is_call_agent = u.role == UserRole.CALL_AGENT
+        is_store_nurse_same_store = (
+            u.role == UserRole.STORE_NURSE and u.store_id == store_id
+        )
+        is_hq_call_agent = is_call_agent and u.store_id is None
+        is_store_call_agent = is_call_agent and u.store_id == store_id
+
+        if risk_level == RiskLevel.LOW and not has_special:
+            if is_hq_call_agent:
+                score -= 15
+            elif is_store_call_agent:
+                score -= 10
+            elif is_store_nurse_same_store:
+                score -= 3
+        elif risk_level == RiskLevel.MEDIUM and not has_special:
+            if is_store_nurse_same_store:
+                score -= 10
+            elif is_store_call_agent:
+                score -= 8
+            elif is_hq_call_agent:
+                score -= 5
+        elif risk_level == RiskLevel.HIGH or has_special:
+            if is_store_nurse_same_store:
+                score -= 20
+            elif is_store_call_agent:
+                score -= 5
+            elif is_hq_call_agent:
+                score -= 0
+
         candidates.append((score, u))
 
     candidates.sort(key=lambda x: x[0])

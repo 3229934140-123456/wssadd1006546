@@ -66,6 +66,40 @@ def run_check_timeout(
     return {"message": f"已标记 {count} 个超时任务", "timeout_count": count}
 
 
+def _get_pending_statuses() -> list:
+    return [
+        TaskStatus.PENDING,
+        TaskStatus.ASSIGNED,
+        TaskStatus.IN_PROGRESS,
+        TaskStatus.ABNORMAL,
+        TaskStatus.DOCTOR_REVIEW,
+        TaskStatus.TIMEOUT,
+    ]
+
+
+def _apply_default_filter(
+    query,
+    status: Optional[TaskStatus],
+    scheduled_date_from: Optional[str],
+    scheduled_date_to: Optional[str],
+):
+    has_explicit_filter = (
+        status is not None
+        or scheduled_date_from is not None
+        or scheduled_date_to is not None
+    )
+    if not has_explicit_filter:
+        today = datetime.utcnow().date()
+        query = query.filter(
+            (
+                (CallbackTask.status.in_(_get_pending_statuses()))
+                & (CallbackTask.scheduled_date <= today)
+            )
+            | (CallbackTask.status == TaskStatus.DOCTOR_REVIEW)
+        )
+    return query
+
+
 @router.get("", response_model=TaskListResponse)
 def list_tasks(
     status: Optional[TaskStatus] = None,
@@ -91,11 +125,16 @@ def list_tasks(
         query = query.filter(CallbackTask.assigned_user_id == current_user.id)
     elif current_user.role == UserRole.DOCTOR:
         query = query.filter(
-            (CallbackTask.assigned_user_id == current_user.id) |
-            (CallbackTask.status == TaskStatus.DOCTOR_REVIEW)
+            (CallbackTask.assigned_user_id == current_user.id)
+            | (
+                (CallbackTask.status == TaskStatus.DOCTOR_REVIEW)
+                & (CallbackTask.store_id == current_user.store_id)
+            )
         )
     elif current_user.role != UserRole.ADMIN and current_user.store_id:
         query = query.filter(CallbackTask.store_id == current_user.store_id)
+
+    query = _apply_default_filter(query, status, scheduled_date_from, scheduled_date_to)
 
     if status:
         query = query.filter(CallbackTask.status == status)
@@ -149,9 +188,18 @@ def get_task(
         raise HTTPException(status_code=404, detail="任务不存在")
     if current_user.role == UserRole.CALL_AGENT and task.assigned_user_id != current_user.id:
         raise HTTPException(status_code=403, detail="无权查看他人任务")
-    if current_user.role not in [UserRole.ADMIN, UserRole.STORE_NURSE] and task.store_id != current_user.store_id:
-        if not (current_user.role == UserRole.DOCTOR and task.status == TaskStatus.DOCTOR_REVIEW):
-            raise HTTPException(status_code=403, detail="无权查看其他门店任务")
+    if current_user.role == UserRole.DOCTOR:
+        can_see = (
+            task.assigned_user_id == current_user.id
+            or (
+                task.status == TaskStatus.DOCTOR_REVIEW
+                and task.store_id == current_user.store_id
+            )
+        )
+        if not can_see:
+            raise HTTPException(status_code=403, detail="无权查看其他门店的复核任务")
+    elif current_user.role not in [UserRole.ADMIN, UserRole.STORE_NURSE] and task.store_id != current_user.store_id:
+        raise HTTPException(status_code=403, detail="无权查看其他门店任务")
     return task
 
 

@@ -1,7 +1,7 @@
 from typing import List, Optional
 from datetime import datetime, date, timedelta
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import func, and_
 
 from ..database import get_db
@@ -11,6 +11,9 @@ from ..models import (
 )
 from ..schemas.stats import (
     StatsOverview, StoreStats, UserStats, TimeoutTaskItem
+)
+from ..services.task_pool_service import (
+    apply_overdue_filter, count_overdue_tasks
 )
 
 router = APIRouter(prefix="/api/stats", tags=["统计看板"])
@@ -60,6 +63,8 @@ def get_stats_overview(
     done_total = status_counts.get(TaskStatus.COMPLETED, 0) + status_counts.get(TaskStatus.DOCTOR_REVIEWED, 0)
     abnormal_total = status_counts.get(TaskStatus.ABNORMAL, 0) + status_counts.get(TaskStatus.DOCTOR_REVIEW, 0) + status_counts.get(TaskStatus.DOCTOR_REVIEWED, 0)
 
+    timeout_count = count_overdue_tasks(db, store_id=store_id, base_query=query)
+
     overview = StatsOverview(
         total_tasks=total,
         pending_tasks=status_counts.get(TaskStatus.PENDING, 0),
@@ -68,7 +73,7 @@ def get_stats_overview(
         completion_rate=safe_div(done_total, total),
         abnormal_tasks=abnormal_total,
         abnormal_rate=safe_div(abnormal_total, total),
-        timeout_tasks=status_counts.get(TaskStatus.TIMEOUT, 0),
+        timeout_tasks=timeout_count,
         doctor_review_tasks=status_counts.get(TaskStatus.DOCTOR_REVIEW, 0),
         doctor_reviewed_tasks=status_counts.get(TaskStatus.DOCTOR_REVIEWED, 0),
     )
@@ -113,7 +118,7 @@ def get_stats_by_store(
             CallbackTask.status.in_([TaskStatus.COMPLETED, TaskStatus.DOCTOR_REVIEWED])
         ).count()
         abnormal = query.filter(CallbackTask.is_abnormal == True).count()
-        timeout = query.filter(CallbackTask.status == TaskStatus.TIMEOUT).count()
+        timeout = count_overdue_tasks(db, store_id=store.id, base_query=query)
         doctor_review = query.filter(
             CallbackTask.status.in_([TaskStatus.DOCTOR_REVIEW, TaskStatus.DOCTOR_REVIEWED])
         ).count()
@@ -212,11 +217,12 @@ def get_timeout_tasks_list(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    query = db.query(CallbackTask).join(Patient).join(Store).filter(
-        (CallbackTask.status.in_([TaskStatus.TIMEOUT, TaskStatus.PENDING, TaskStatus.ASSIGNED])) &
-        (CallbackTask.due_time.isnot(None)) &
-        (CallbackTask.due_time < datetime.utcnow())
+    query = db.query(CallbackTask).options(
+        joinedload(CallbackTask.patient),
+        joinedload(CallbackTask.store),
     )
+
+    query = apply_overdue_filter(query)
 
     if current_user.role != UserRole.ADMIN and current_user.store_id:
         store_id = current_user.store_id
